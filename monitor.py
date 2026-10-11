@@ -5,21 +5,28 @@ import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Переменные из окружения BotHost
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# ---------- КОНФИГ ----------
+TELEGRAM_TOKEN = (
+    os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+)
 CHAT_ID = os.getenv("CHAT_ID")
-PRICE_DROP_PERCENT = 15  # Оповещать, если цена упала на 15% или больше
+PRICE_DROP_PERCENT = 15
 
-# ID категорий Wildberries:
-# 5130 — Ноутбуки и компьютеры (включая ноуты)
-# 5133 — Планшеты
-CATEGORIES = [5130, 5133]
+# База в /app/data — переживает пересборку контейнера на BotHost
+DB_PATH = os.getenv("DB_PATH", "/app/data/prices.db")
 
+# Внутренние subject ID подкатегорий WB
+CATEGORIES = [5130, 5133]  # ноутбуки, планшеты
+SHARD = "electronic"
+
+# ---------- БАЗА ----------
 def init_db():
-    """Создает базу данных для истории цен категорий."""
-    conn = sqlite3.connect("prices.db")
-    cursor = conn.cursor()
-    cursor.execute("""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             article INTEGER PRIMARY KEY,
             name TEXT,
@@ -29,119 +36,146 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ---------- ТОВАРЫ ----------
 async def get_category_products(subject_id):
-    """Парсит топ товаров из конкретной категории WB по её subject ID."""
-    # Стабильный API эндпоинт каталога с фильтром по категории (subject)
-    url = f"https://wb.ru{subject_id}"
-    
+    url = (
+        f"https://catalog.wb.ru/catalog/{SHARD}/v2/catalog"
+        f"?appType=1&curr=rub&dest=-1257786&sort=popular"
+        f"&spp=30&subject={subject_id}&page=1"
+    )
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-        "Accept": "*/*"
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Origin": "https://www.wildberries.ru",
+        "Referer": "https://www.wildberries.ru/",
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=12) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    products = data.get("data", {}).get("products", [])
-                    print(f"📦 Категория {subject_id}: Успешно загружено {len(products)} товаров.")
-                    return products
+            async with session.get(url, headers=headers, timeout=15) as response:
+                if response.status != 200:
+                    print(f"⚠️ Категория {subject_id}: HTTP {response.status}")
+                    return []
+                data = await response.json()
+                products = data.get("data", {}).get("products", [])
+                print(f"📦 Категория {subject_id}: загружено {len(products)} товаров.")
+                return products
     except Exception as e:
-        print(f"Ошибка при парсинге категории {subject_id}: {e}")
-    return []
+        print(f"❌ Ошибка категории {subject_id}: {e}")
+        return []
 
+# ---------- ЦИКЛ ----------
 async def check_prices(application: Application):
-    """Фоновый цикл: собирает категории и ищет падение цен."""
     while True:
-        print("🔄 Начало глобальной проверки категорий ноутбуков и планшетов...")
-        
+        print("🔄 Проверка категорий...")
         all_products = []
         for cat_id in CATEGORIES:
             products = await get_category_products(cat_id)
             all_products.extend(products)
-            await asyncio.sleep(2) # Небольшая пауза между категориями, чтобы не спамить
-            
+            await asyncio.sleep(3)
+
         if not all_products:
-            print("📭 Не удалось получить товары ни из одной категории.")
+            print("📭 Товары не получены.")
         else:
-            conn = sqlite3.connect("prices.db")
-            cursor = conn.cursor()
-            alerts_sent = 0
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            alerts = 0
 
             for prod in all_products:
                 article = prod.get("id")
+                if not article:
+                    continue
+
                 name = f"{prod.get('brand', '')} {prod.get('name', '')}".strip()
-                # Получаем цену со всеми скидками в рублях
-                current_price = prod.get("sizes", [{}]).get("price", {}).get("salePriceU", 0) / 100
-                
+
+                sizes = prod.get("sizes") or []
+                if not sizes:
+                    continue
+                price_info = sizes[0].get("price", {})
+                current_price = (price_info.get("salePriceU") or 0) / 100
                 if current_price == 0:
                     continue
 
-                cursor.execute("SELECT name, last_price FROM products WHERE article = ?", (article,))
-                row = cursor.fetchone()
+                cur.execute(
+                    "SELECT name, last_price FROM products WHERE article = ?",
+                    (article,),
+                )
+                row = cur.fetchone()
 
                 if row is None:
-                    # Если товар видим впервые — просто сохраняем его стартовую цену
-                    cursor.execute("INSERT INTO products (article, name, last_price) VALUES (?, ?, ?)", 
-                                   (article, name, current_price))
+                    cur.execute(
+                        "INSERT INTO products (article, name, last_price) VALUES (?, ?, ?)",
+                        (article, name, current_price),
+                    )
                 else:
-                    old_name, last_price = row
+                    _, last_price = row
                     if current_price < last_price:
-                        drop_percent = ((last_price - current_price) / last_price) * 100
-                        
-                        if drop_percent >= PRICE_DROP_PERCENT:
-                            print(f"🔥 НАЙДЕНА СКИДКА: {name} (-{drop_percent:.1f}%)")
-                            message = (
-                                f"🚨 **ЦЕНА УПАЛА В КАТАЛОГЕ!** 🚨\n\n"
-                                f"📦 **Товар:** {name}\n"
-                                f"🆔 **Артикул:** `{article}`\n"
-                                f"📉 **Старая цена:** {last_price} руб.\n"
-                                f"🔥 **Новая цена:** {current_price} руб. (-{drop_percent:.1f}%)\n\n"
-                                f"🔗 [Открыть на Wildberries](https://wildberries.ru{article}/detail.aspx)"
+                        drop = ((last_price - current_price) / last_price) * 100
+                        if drop >= PRICE_DROP_PERCENT:
+                            print(f"🔥 СКИДКА: {name} (-{drop:.1f}%)")
+                            safe = (
+                                name.replace("_", "\\_")
+                                    .replace("*", "\\*")
+                                    .replace("`", "\\`")
+                            )
+                            msg = (
+                                f"🚨 *ЦЕНА УПАЛА!*\n\n"
+                                f"📦 *Товар:* {safe}\n"
+                                f"🆔 *Артикул:* `{article}`\n"
+                                f"📉 *Было:* {last_price:.0f} ₽\n"
+                                f"🔥 *Стало:* {current_price:.0f} ₽ (-{drop:.1f}%)\n\n"
+                                f"🔗 [Открыть на WB](https://www.wildberries.ru/catalog/{article}/detail.aspx)"
                             )
                             try:
-                                await application.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
-                                alerts_sent += 1
-                                await asyncio.sleep(0.5) # Защита от флуда в телеграм
+                                await application.bot.send_message(
+                                    chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
+                                )
+                                alerts += 1
+                                await asyncio.sleep(0.5)
                             except Exception as te:
-                                print(f"⚠️ Ошибка отправки алерта: {te}")
+                                print(f"⚠️ Отправка: {te}")
 
-                    # Обновляем цену до актуальной для следующего сравнения
-                    cursor.execute("UPDATE products SET last_price = ? WHERE article = ?", (current_price, article))
+                    cur.execute(
+                        "UPDATE products SET last_price = ? WHERE article = ?",
+                        (current_price, article),
+                    )
 
             conn.commit()
             conn.close()
-            print(f"✅ База данных обновлена. Отправлено алертов за этот круг: {alerts_sent}")
-            
-        print("💤 Мониторинг засыпает на 5 минут...")
+            print(f"✅ Обновлено. Алертов: {alerts}")
+
+        print("💤 Сон 5 минут...")
         await asyncio.sleep(300)
 
+# ---------- TELEGRAM ----------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ответ на команду /start."""
     user_name = update.effective_user.first_name
-    reply_text = (
+    await update.message.reply_text(
         f"Привет, {user_name}! 👋\n\n"
-        f"🤖 Я переключился в автоматический режим!\n"
-        f"🔍 Теперь я без остановки мониторю разделы **Ноутбуков** и **Планшетов** на WB.\n"
-        f"📉 Как только цена на какой-то из них упадет сильнее чем на {PRICE_DROP_PERCENT}%, админ сразу получит уведомление."
+        f"🤖 Мониторю *Ноутбуки* и *Планшеты* на WB.\n"
+        f"📉 Если цена упадёт на {PRICE_DROP_PERCENT}% и больше — пришлю алерт."
     )
-    await update.message.reply_text(text=reply_text)
 
+async def post_init(application: Application):
+    application.create_task(check_prices(application))
+
+# ---------- MAIN ----------
 def main():
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ Ошибка: Переменные окружения TELEGRAM_TOKEN или CHAT_ID отсутствуют!")
+        print("❌ Нет TELEGRAM_TOKEN или CHAT_ID!")
         return
-
     init_db()
-
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command))
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(check_prices(application))
-
-    print("🚀 Бот-каталогизатор успешно запущен на хостинге...")
-    application.run_polling()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", start_command))
+    print("🚀 Бот запущен.")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
