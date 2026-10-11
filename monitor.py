@@ -14,10 +14,10 @@ TELEGRAM_TOKEN = (
 CHAT_ID = os.getenv("CHAT_ID")
 PRICE_DROP_PERCENT = 15
 
-# База в /app/data — переживает пересборку контейнера на BotHost
+# База в /app/data — переживает пересборку
 DB_PATH = os.getenv("DB_PATH", "/app/data/prices.db")
 
-# Поисковые запросы вместо subject ID — надёжнее, чем catalog.wb.ru
+# Поисковые запросы вместо subject ID
 SEARCH_QUERIES = ["ноутбук", "планшет"]
 
 # ---------- БАЗА ----------
@@ -65,87 +65,92 @@ async def search_products(query):
         print(f"❌ Ошибка поиска '{query}': {e}")
         return []
 
-# ---------- ОДИН ПРОХОД ----------
-async def check_prices_job(context: ContextTypes.DEFAULT_TYPE):
-    application = context.application
-    print("🔄 Проверка категорий...")
+# ---------- ОСНОВНОЙ ЦИКЛ (ВНУТРИ EVENT LOOP БОТА) ----------
+async def price_monitor_loop(application: Application):
+    # ждём, пока приложение реально стартует
+    while not application.running:
+        await asyncio.sleep(1)
 
-    all_products = []
-    for q in SEARCH_QUERIES:
-        products = await search_products(q)
-        all_products.extend(products)
-        await asyncio.sleep(3)
+    while True:
+        print("🔄 Проверка категорий...")
+        all_products = []
+        for q in SEARCH_QUERIES:
+            products = await search_products(q)
+            all_products.extend(products)
+            await asyncio.sleep(3)
 
-    if not all_products:
-        print("📭 Товары не получены.")
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    alerts = 0
-
-    for prod in all_products:
-        article = prod.get("id")
-        if not article:
-            continue
-
-        name = f"{prod.get('brand', '')} {prod.get('name', '')}".strip()
-
-        sizes = prod.get("sizes") or []
-        if not sizes:
-            continue
-        price_info = sizes[0].get("price", {})
-        current_price = (price_info.get("salePriceU") or 0) / 100
-        if current_price == 0:
-            continue
-
-        cur.execute(
-            "SELECT name, last_price FROM products WHERE article = ?",
-            (article,),
-        )
-        row = cur.fetchone()
-
-        if row is None:
-            cur.execute(
-                "INSERT INTO products (article, name, last_price) VALUES (?, ?, ?)",
-                (article, name, current_price),
-            )
+        if not all_products:
+            print("📭 Товары не получены.")
         else:
-            _, last_price = row
-            if current_price < last_price:
-                drop = ((last_price - current_price) / last_price) * 100
-                if drop >= PRICE_DROP_PERCENT:
-                    print(f"🔥 СКИДКА: {name} (-{drop:.1f}%)")
-                    safe = (
-                        name.replace("_", "\\_")
-                            .replace("*", "\\*")
-                            .replace("`", "\\`")
-                    )
-                    msg = (
-                        f"🚨 *ЦЕНА УПАЛА!*\n\n"
-                        f"📦 *Товар:* {safe}\n"
-                        f"🆔 *Артикул:* `{article}`\n"
-                        f"📉 *Было:* {last_price:.0f} ₽\n"
-                        f"🔥 *Стало:* {current_price:.0f} ₽ (-{drop:.1f}%)\n\n"
-                        f"🔗 [Открыть на WB](https://www.wildberries.ru/catalog/{article}/detail.aspx)"
-                    )
-                    try:
-                        await application.bot.send_message(
-                            chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
-                        )
-                        alerts += 1
-                        await asyncio.sleep(0.5)
-                    except Exception as te:
-                        print(f"⚠️ Отправка: {te}")
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            alerts = 0
 
-            cur.execute(
-                "UPDATE products SET last_price = ? WHERE article = ?",
-                (current_price, article),
-            )
+            for prod in all_products:
+                article = prod.get("id")
+                if not article:
+                    continue
 
-    conn.commit()
-    conn.close()
-    print(f"✅ Обновлено. Алертов: {alerts}")
+                name = f"{prod.get('brand', '')} {prod.get('name', '')}".strip()
+
+                sizes = prod.get("sizes") or []
+                if not sizes:
+                    continue
+                price_info = sizes[0].get("price", {})
+                current_price = (price_info.get("salePriceU") or 0) / 100
+                if current_price == 0:
+                    continue
+
+                cur.execute(
+                    "SELECT name, last_price FROM products WHERE article = ?",
+                    (article,),
+                )
+                row = cur.fetchone()
+
+                if row is None:
+                    cur.execute(
+                        "INSERT INTO products (article, name, last_price) VALUES (?, ?, ?)",
+                        (article, name, current_price),
+                    )
+                else:
+                    _, last_price = row
+                    if current_price < last_price:
+                        drop = ((last_price - current_price) / last_price) * 100
+                        if drop >= PRICE_DROP_PERCENT:
+                            print(f"🔥 СКИДКА: {name} (-{drop:.1f}%)")
+                            safe = (
+                                name.replace("_", "\\_")
+                                    .replace("*", "\\*")
+                                    .replace("`", "\\`")
+                            )
+                            msg = (
+                                f"🚨 *ЦЕНА УПАЛА!*\n\n"
+                                f"📦 *Товар:* {safe}\n"
+                                f"🆔 *Артикул:* `{article}`\n"
+                                f"📉 *Было:* {last_price:.0f} ₽\n"
+                                f"🔥 *Стало:* {current_price:.0f} ₽ (-{drop:.1f}%)\n\n"
+                                f"🔗 [Открыть на WB](https://www.wildberries.ru/catalog/{article}/detail.aspx)"
+                            )
+                            try:
+                                await application.bot.send_message(
+                                    chat_id=CHAT_ID, text=msg, parse_mode="Markdown"
+                                )
+                                alerts += 1
+                                await asyncio.sleep(0.5)
+                            except Exception as te:
+                                print(f"⚠️ Отправка: {te}")
+
+                    cur.execute(
+                        "UPDATE products SET last_price = ? WHERE article = ?",
+                        (current_price, article),
+                    )
+
+            conn.commit()
+            conn.close()
+            print(f"✅ Обновлено. Алертов: {alerts}")
+
+        print("💤 Сон 5 минут...")
+        await asyncio.sleep(300)
 
 # ---------- TELEGRAM ----------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,16 +161,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📉 Если цена упадёт на {PRICE_DROP_PERCENT}% и больше — пришлю алерт."
     )
 
+async def on_startup(application: Application):
+    """Запускает фоновый цикл внутри уже работающего event loop."""
+    application.create_task(price_monitor_loop(application))
+
 # ---------- MAIN ----------
 def main():
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("❌ Нет TELEGRAM_TOKEN или CHAT_ID!")
         return
     init_db()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(on_startup)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start_command))
-    # первый запуск через 10 сек, дальше каждые 5 минут
-    app.job_queue.run_repeating(check_prices_job, interval=300, first=10)
     print("🚀 Бот запущен.")
     app.run_polling()
 
