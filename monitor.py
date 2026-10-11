@@ -5,16 +5,18 @@ import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Загружаем переменные из окружения хостинга
+# Переменные из окружения BotHost
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-PRICE_DROP_PERCENT = 15 
+PRICE_DROP_PERCENT = 15  # Оповещать, если цена упала на 15% или больше
 
-# Твои артикулы электроники для теста
-TRACKED_ARTICLES = [214328456, 154673412, 180900123]
+# ID категорий Wildberries:
+# 5130 — Ноутбуки и компьютеры (включая ноуты)
+# 5133 — Планшеты
+CATEGORIES = [5130, 5133]
 
 def init_db():
-    """Создает базу данных, если её нет."""
+    """Создает базу данных для истории цен категорий."""
     conn = sqlite3.connect("prices.db")
     cursor = conn.cursor()
     cursor.execute("""
@@ -27,40 +29,50 @@ def init_db():
     conn.commit()
     conn.close()
 
-async def get_wb_data(articles):
-    """Асинхронное получение данных с WB."""
-    id_list = ";".join(map(str, articles))
-    url = f"https://wb.ru{id_list}"
+async def get_category_products(subject_id):
+    """Парсит топ товаров из конкретной категории WB по её subject ID."""
+    # Стабильный API эндпоинт каталога с фильтром по категории (subject)
+    url = f"https://wb.ru{subject_id}"
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "Accept": "*/*"
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=10) as response:
+            async with session.get(url, headers=headers, timeout=12) as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data.get("data", {}).get("products", [])
+                    products = data.get("data", {}).get("products", [])
+                    print(f"📦 Категория {subject_id}: Успешно загружено {len(products)} товаров.")
+                    return products
     except Exception as e:
-        print(f"Ошибка при запросе к WB: {e}")
+        print(f"Ошибка при парсинге категории {subject_id}: {e}")
     return []
 
 async def check_prices(application: Application):
-    """Циклическая асинхронная проверка цен."""
+    """Фоновый цикл: собирает категории и ищет падение цен."""
     while True:
-        print("🔄 Проверяю цены на Wildberries...")
-        products = await get_wb_data(TRACKED_ARTICLES)
+        print("🔄 Начало глобальной проверки категорий ноутбуков и планшетов...")
         
-        if not products:
-            print("📭 Не удалось получить данные о товарах.")
+        all_products = []
+        for cat_id in CATEGORIES:
+            products = await get_category_products(cat_id)
+            all_products.extend(products)
+            await asyncio.sleep(2) # Небольшая пауза между категориями, чтобы не спамить
+            
+        if not all_products:
+            print("📭 Не удалось получить товары ни из одной категории.")
         else:
             conn = sqlite3.connect("prices.db")
             cursor = conn.cursor()
+            alerts_sent = 0
 
-            for prod in products:
+            for prod in all_products:
                 article = prod.get("id")
-                name = prod.get("name")
-                current_price = prod.get("sizes", [{}])[0].get("price", {}).get("salePriceU", 0) / 100
+                name = f"{prod.get('brand', '')} {prod.get('name', '')}".strip()
+                # Получаем цену со всеми скидками в рублях
+                current_price = prod.get("sizes", [{}]).get("price", {}).get("salePriceU", 0) / 100
                 
                 if current_price == 0:
                     continue
@@ -69,18 +81,18 @@ async def check_prices(application: Application):
                 row = cursor.fetchone()
 
                 if row is None:
+                    # Если товар видим впервые — просто сохраняем его стартовую цену
                     cursor.execute("INSERT INTO products (article, name, last_price) VALUES (?, ?, ?)", 
                                    (article, name, current_price))
-                    print(f"➕ Добавлен товар: {name} — {current_price} руб.")
                 else:
                     old_name, last_price = row
                     if current_price < last_price:
                         drop_percent = ((last_price - current_price) / last_price) * 100
-                        print(f"📉 Снижение на {name}: {last_price} -> {current_price} (-{drop_percent:.1f}%)")
                         
                         if drop_percent >= PRICE_DROP_PERCENT:
+                            print(f"🔥 НАЙДЕНА СКИДКА: {name} (-{drop_percent:.1f}%)")
                             message = (
-                                f"🚨 **ЦЕНА УПАЛА!** 🚨\n\n"
+                                f"🚨 **ЦЕНА УПАЛА В КАТАЛОГЕ!** 🚨\n\n"
                                 f"📦 **Товар:** {name}\n"
                                 f"🆔 **Артикул:** `{article}`\n"
                                 f"📉 **Старая цена:** {last_price} руб.\n"
@@ -89,46 +101,46 @@ async def check_prices(application: Application):
                             )
                             try:
                                 await application.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
+                                alerts_sent += 1
+                                await asyncio.sleep(0.5) # Защита от флуда в телеграм
                             except Exception as te:
-                                print(f"⚠️ Ошибка отправки уведомления: {te}")
+                                print(f"⚠️ Ошибка отправки алерта: {te}")
 
+                    # Обновляем цену до актуальной для следующего сравнения
                     cursor.execute("UPDATE products SET last_price = ? WHERE article = ?", (current_price, article))
 
             conn.commit()
             conn.close()
+            print(f"✅ База данных обновлена. Отправлено алертов за этот круг: {alerts_sent}")
             
-        print("💤 Проверка завершена. Жду 5 минут...")
-        await asyncio.sleep(300)  # Асинхронный сон, не блокирующий обработку команд
+        print("💤 Мониторинг засыпает на 5 минут...")
+        await asyncio.sleep(300)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
+    """Ответ на команду /start."""
     user_name = update.effective_user.first_name
     reply_text = (
         f"Привет, {user_name}! 👋\n\n"
-        f"🤖 Я — приватный бот-монитор цен Wildberries.\n"
-        f"⚙️ Работаю в фоновом режиме: сканирую технику каждые 5 минут и присылаю алерты о жестких скидках администратору."
+        f"🤖 Я переключился в автоматический режим!\n"
+        f"🔍 Теперь я без остановки мониторю разделы **Ноутбуков** и **Планшетов** на WB.\n"
+        f"📉 Как только цена на какой-то из них упадет сильнее чем на {PRICE_DROP_PERCENT}%, админ сразу получит уведомление."
     )
     await update.message.reply_text(text=reply_text)
 
 def main():
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ Ошибка: Переменные TELEGRAM_TOKEN или CHAT_ID не найдены!")
+        print("❌ Ошибка: Переменные окружения TELEGRAM_TOKEN или CHAT_ID отсутствуют!")
         return
 
     init_db()
 
-    # Создаем приложение телеграм-бота
     application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Регистрируем команду /start
     application.add_handler(CommandHandler("start", start_command))
 
-    # Запускаем фоновую задачу парсинга WB внутри общего цикла событий
     loop = asyncio.get_event_loop()
     loop.create_task(check_prices(application))
 
-    # Запускаем самого бота (он будет слушать команды)
-    print("🚀 Бот успешно запущен и слушает команды...")
+    print("🚀 Бот-каталогизатор успешно запущен на хостинге...")
     application.run_polling()
 
 if __name__ == "__main__":
